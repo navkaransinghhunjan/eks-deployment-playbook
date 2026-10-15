@@ -1,0 +1,81 @@
+# What the GitLab deploy job is allowed to do on non-prod, and nothing else.
+#
+# Bound to the Kubernetes group `gitlab-deployers`, not to a principal. The EKS
+# access entry maps the IAM user into that group, so onboarding a second CI
+# principal later is one `create-access-entry` and no change here.
+#
+# Namespaced to `<NAMESPACE>` on purpose: the deploy jobs only ever touch that one
+# namespace, so a compromised runner variable cannot reach kube-system, keda or
+# traefik.
+#
+# This cannot be an EKS managed access policy. AmazonEKSEditPolicy derives from
+# the built-in `edit` ClusterRole, which covers no custom resources -- the
+# traefik and KEDA kinds in the deploy manifest would all 403.
+#
+#   kubectl apply -f rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gitlab-deployer
+  namespace: <NAMESPACE>
+rules:
+  # `kubectl apply` needs get (three-way merge) before create/patch. delete is
+  # for the teardown:* jobs that back each branch environment's on_stop.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # traefik: Middleware (strip prefix) + IngressRoute (host/path -> interceptor)
+  - apiGroups: ["traefik.io"]
+    resources: ["middlewares", "ingressroutes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # keda: HTTPScaledObject for the request-scaled services. The ScaledObject the
+  # http-add-on spawns from one of these is KEDA's to own, not the deployer's.
+  - apiGroups: ["http.keda.sh"]
+    resources: ["httpscaledobjects"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # keda: raw ScaledObject, applied directly by the queue-scaled Temporal workers
+  # (pocs/workflow kubernetes/workflow.yaml + stub-worker.yaml). Unlike the HTTP
+  # add-on's, these are authored by us, so the deployer does need keda.sh here.
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # batch: the one-time app schema bootstrap (pocs/workflow db-init-job.yaml).
+  # `kubectl wait --for=condition=complete` needs get+watch.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  # service-a ships its media PVC alongside its workloads, so the deploy job
+  # creates it. No `delete`, on purpose -- that volume holds uploaded documents. Same shape
+  # tenant-a uses. doc-ai-service never needed this: its weights are a hostPath, not a PVC.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # Read-only. Not needed to deploy -- needed to debug a failed one from the job
+  # log without a human opening a second terminal.
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+  # doc-ai-service classifier runs on the llm box; its Service has hand-written Endpoints.
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gitlab-deployer
+  namespace: <NAMESPACE>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gitlab-deployer
+subjects:
+  - kind: Group
+    name: gitlab-deployers # set by the EKS access entry, see deploy-access.md
+    apiGroup: rbac.authorization.k8s.io

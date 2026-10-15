@@ -1,0 +1,167 @@
+# Model weights: S3 → node-local hostPath, primed by an initContainer. install-log.md § 20.
+# No EFS — the charts' six `nfs:` mounts are deleted, not ported.
+#
+# fetch.sh is tenant-a/weights-loader.yaml's script with only the default SRC changed. Its
+# ETag cache, mkdir lock and explicit `if`s are each a paid-for bug fix — do not "simplify".
+# SRC defaults to the tenant-a weights bucket, which the shared IRSA role already reads.
+#
+#   kubectl apply -f <POOL>-weights-loader.yaml
+#   kubectl -n <NAMESPACE> delete job <POOL>-weights-probe --ignore-not-found   # to re-run the probe
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: <POOL>-weights-fetch
+  namespace: <NAMESPACE>
+data:
+  fetch.sh: |
+    #!/bin/sh
+    # Prime /w with $SERVICE's weights from $SRC/$ARCHIVE, unless already current.
+    # Required env: SERVICE, ARCHIVE. Optional: SRC (defaults to the tenant-c bucket).
+    set -eu
+    SRC=${SRC:-s3://<WEIGHTS_BUCKET>}
+    : "${SERVICE:?SERVICE not set}"
+    : "${ARCHIVE:?ARCHIVE not set}"
+
+    STAMP=/w/.etag
+    LOCK=/w/.lock
+
+    # Cache key is the S3 ETag, so re-uploading an archive invalidates every node's copy.
+    # If HEAD fails we cannot prove the cache is stale, so a warm cache is used rather than
+    # failing the pod — a transient S3 blip should not take a service down.
+    ETAG=$(aws s3api head-object --bucket "${SRC#s3://}" --key "$ARCHIVE" \
+             --query ETag --output text 2>/dev/null || echo "")
+    if [ -n "$ETAG" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$ETAG" ]; then
+      echo "== $SERVICE: cache HIT ($ETAG) — $(du -sh /w | cut -f1) on node, skipping download."
+      exit 0
+    fi
+    if [ -z "$ETAG" ] && [ -f "$STAMP" ]; then
+      echo "!! $SERVICE: S3 HEAD failed but a cache exists — using it rather than failing."
+      exit 0
+    fi
+
+    # Two pods of the same service can land on one node together; mkdir is atomic, so the
+    # loser waits for the winner instead of extracting over the top of it.
+    #
+    # NOTE the explicit `if` rather than `[ ... ] && [ ... ] && { ...; }`. Under `set -e` an
+    # AND-list that short-circuits returns non-zero and kills the script, so the terse form
+    # would abort the wait on the first miss instead of looping.
+    waited=0
+    while ! mkdir "$LOCK" 2>/dev/null; do
+      # A pod killed mid-download (spot reclaim, OOM) leaves the lock dir behind. Without a
+      # ceiling every later pod on that node would wait forever on a holder that is gone.
+      # 30 min is comfortably longer than the largest archive takes to pull and extract.
+      if [ "$waited" -ge 1800 ]; then
+        echo "!! $SERVICE: lock held for ${waited}s — assuming a dead holder, taking it over."
+        break
+      fi
+      echo "== $SERVICE: another pod is priming this node, waiting (${waited}s)..."
+      sleep 10
+      waited=$((waited + 10))
+      if [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$ETAG" ]; then
+        echo "== $SERVICE: primed by the other pod."
+        exit 0
+      fi
+    done
+    trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+
+    echo "== $SERVICE <- $SRC/$ARCHIVE (etag $ETAG)"
+    # --only-show-errors: the default progress meter writes a line per 256 KiB, which for a
+    # multi-GB archive is tens of thousands of lines of noise in `kubectl logs`.
+    aws s3 cp --only-show-errors "$SRC/$ARCHIVE" /tmp/r.zip
+
+    # The aws-cli image ships no unzip. The § 20d probe Job installs it inline and this script
+    # did not, so the first real initContainer downloaded all 2.3 GiB and then died on
+    # `unzip: command not found` — and because the ETag stamp is only written after a
+    # successful extract, every retry paid for the download again.
+    command -v unzip >/dev/null 2>&1 || \
+      yum install -y unzip >/dev/null 2>&1 || \
+      microdnf install -y unzip >/dev/null 2>&1
+
+    echo "-- archive contents (THIS is the layout the manifest mountPath must match):"
+    unzip -l /tmp/r.zip
+
+    # Replace rather than merge: a stale file the new archive no longer contains is worse
+    # than a slow re-extract. Keep the lock dir itself.
+    find /w -mindepth 1 -maxdepth 1 ! -name .lock -exec rm -rf {} +
+    unzip -q -o /tmp/r.zip -d /w
+    rm -f /tmp/r.zip
+    # Explicit `if`, not `[ -n "$ETAG" ] && printf ...` — under `set -e` that AND-list
+    # returns non-zero when ETAG is empty and would fail the initContainer AFTER a
+    # successful extract, so the pod would never start despite the weights being fine.
+    if [ -n "$ETAG" ]; then
+      printf '%s' "$ETAG" > "$STAMP"
+    else
+      echo "!! $SERVICE: no ETag available — not writing a cache stamp, so the next pod re-pulls."
+    fi
+
+    echo "-- top level of /w:"; ls -la /w
+    echo "-- size on node:";    du -sh /w
+---
+# Layout probe — prints `unzip -l` per archive, keeps nothing. § 20a.
+# Only the icd entry is verified present; the rest are candidates, so `MISSING` is expected.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: <POOL>-weights-probe
+  namespace: <NAMESPACE>
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels: { app: <POOL>-weights-probe }
+    spec:
+      restartPolicy: Never
+      serviceAccountName: <IRSA_SERVICE_ACCOUNT>            # IRSA -- no static keys, bucket is in-account
+      nodeSelector: { workload: <POOL> }
+      tolerations:
+        - { key: workload, operator: Equal, value: <POOL>, effect: NoSchedule }
+      volumes:
+        - name: scratch
+          # Fits on the pool's 200Gi root volume (nodepool.yaml); would not fit on
+          # Karpenter's 20Gi AL2023 default.
+          emptyDir: { sizeLimit: 20Gi }
+      containers:
+        - name: probe
+          image: amazon/aws-cli:2.17.0
+          env:
+            - { name: AWS_DEFAULT_REGION, value: ap-south-1 }
+            - { name: SRC, value: "s3://<WEIGHTS_BUCKET>" }   # quoted: `:` in a flow map
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              # aws-cli is Amazon Linux based and ships no unzip.
+              yum install -y unzip >/dev/null 2>&1 || microdnf install -y unzip
+
+              # VERIFIED present and readable:
+              set -- icd-medical-coding:ICD_Medical_Coding/v5/resources.zip
+              # Identified 2026-09-15 and NOT tenant-c's (§ 20a): <MODEL_A>/v1 is a
+              # sibling ICD build, <MODEL_B>/v30 is doc-ai-service/tenant-d, <MODEL_C>/v9
+              # is the tenant-a CV stack. Re-add here only to re-check them.
+              # NOT in this bucket -- medical-bills-nlp reads
+              # s3://<WEIGHTS_BUCKET>/NLP_MEDICAL_BILLS/v32/. That bucket needs a policy
+              # grant (install-log.md § 20a) and its key path is unverified, so it is not
+              # listed here yet.
+
+              for entry in "$@"; do
+                svc=${entry%%:*}; path=${entry#*:}
+                echo "================================================================"
+                echo "== $svc  <-  $SRC/$path"
+                if ! aws s3 cp --only-show-errors "$SRC/$path" /s/r.zip 2>/dev/null; then
+                  echo "!! MISSING: $SRC/$path — not uploaded yet (install-log.md § 20b)"
+                  continue
+                fi
+                echo "-- SET THIS SERVICE'S mountPath/subPath FROM THE TREE BELOW:"
+                unzip -l /s/r.zip
+                rm -f /s/r.zip
+              done
+              echo "================================================================"
+              echo "== done. Copy the paths above into each service manifest (§ 20d)."
+          volumeMounts:
+            - { name: scratch, mountPath: /s }
+          resources:
+            # Network- and disk-bound. Memory is unzip buffers only; nothing is read whole.
+            requests: { cpu: 250m, memory: 256Mi }
+            limits:   { cpu: "2",  memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false

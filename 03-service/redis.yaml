@@ -1,0 +1,58 @@
+# A Redis of its own, deliberately.
+#
+# CELERY_BROKER_URL is built as `redis://$REDIS_HOST:$REDIS_PORT` with NO database index
+# (settings.py:158), so it always lands on db 0 — `REDIS_DB` in the VM environment is not
+# actually read by celery. Pointing this Deployment at the VM's Redis (<HOST:PORT>,
+# reachable from the cluster) would therefore put the EKS worker on the SAME broker and db as
+# the VM's live worker, and the two would split the queue between them. Tasks would run in the
+# wrong place with no error anywhere. install-log C56.
+#
+# No persistence: this holds a celery broker and a cache. The beat schedule lives in Postgres
+# (DatabaseScheduler), so nothing here needs to survive a restart — in-flight tasks are lost,
+# which is the accepted trade for non-prod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${SVC_NAME}-redis
+  namespace: <NAMESPACE>
+  labels: { app: ${SVC_NAME}-redis }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: ${SVC_NAME}-redis }
+  template:
+    metadata:
+      labels: { app: ${SVC_NAME}-redis }
+    spec:
+      nodeSelector: { workload: ${SVC_POOL} }
+      tolerations:
+        - { key: workload, operator: Equal, value: ${SVC_POOL}, effect: NoSchedule }
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          # maxmemory below the container limit, and allkeys-lru so a filling cache evicts
+          # instead of being OOMKilled — an OOMKill would drop the broker with it.
+          args: ["--maxmemory", "384mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+          ports:
+            - { name: redis, containerPort: 6379 }
+          readinessProbe:
+            exec: { command: ["redis-cli", "PING"] }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m,  memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            seccompProfile: { type: RuntimeDefault }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${SVC_NAME}-redis
+  namespace: <NAMESPACE>
+spec:
+  type: ClusterIP
+  selector: { app: ${SVC_NAME}-redis }
+  ports:
+    - { name: redis, port: 6379, targetPort: redis }

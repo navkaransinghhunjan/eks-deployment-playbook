@@ -1,0 +1,18 @@
+# Uploaded documents (22 `upload_to` fields; MEDIA_ROOT is local disk and no S3 storage
+# backend is configured). Shared between the web Deployment and the celery worker, so it
+# cannot be an emptyDir.
+#
+# RWO, following tenant-a: gp3 binds WaitForFirstConsumer, so the volume lands in the anchor
+# pod's AZ and both workloads must sit on one node — see the podAffinity in
+# example-<NAMESPACE>-api.yaml. 20Gi is a starting point; gp3 expands in place.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${SVC_NAME}-media
+  namespace: <NAMESPACE>
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 20Gi

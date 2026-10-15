@@ -1,0 +1,139 @@
+# medical-fraud-detection into ns `<NAMESPACE>` — arch_knowlenge_base <NAMESPACE>/install-log.md §§ 16-28.
+#
+# Simplest shape in the set: one Deployment, no worker, no PVC, no weights. LLM calls go out
+# to OpenAI over the NAT gateway; the only state is the request itself.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${SVC_NAME}
+  namespace: <NAMESPACE>
+  labels: { app: ${SVC_NAME} }
+spec:
+  # No replicas: the HTTPScaledObject owns the count.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels: { app: ${SVC_NAME} }
+  template:
+    metadata:
+      labels: { app: ${SVC_NAME} }
+    spec:
+      serviceAccountName: <IRSA_SERVICE_ACCOUNT>
+      nodeSelector: { workload: ${SVC_POOL} }
+      tolerations:
+        - { key: workload, operator: Equal, value: ${SVC_POOL}, effect: NoSchedule }
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: app
+          image: ${SVC_IMAGE}
+          ports:
+            - { name: http, containerPort: 8080 }
+          envFrom:
+            - configMapRef: { name: ${SVC_ENDPOINTS}, optional: true }
+            - configMapRef: { name: <NAMESPACE>-otel,    optional: true }
+            # Required, not optional: the app fails at startup without the key, and a
+            # required ref leaves the pod Pending with the Secret named in the event.
+            - secretRef:    { name: ${SVC_SECRET} }
+          env:
+            - { name: AWS_DEFAULT_REGION, value: ap-south-1 }
+            - name: K8S_NODE_IP
+              valueFrom: { fieldRef: { fieldPath: status.hostIP } }
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://$(K8S_NODE_IP):4318
+            - { name: OTEL_SERVICE_NAME, value: <POOL>-medical-fraud-detection }
+          # /openapi.json, not tcpSocket: FastAPI serves it by default, so it proves the ASGI
+          # app is actually up rather than just that the port is bound — and unlike a real
+          # route it costs no LLM call. This app has no /health endpoint (install-log C24).
+          startupProbe:
+            httpGet: { path: /openapi.json, port: http }
+            periodSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            httpGet: { path: /openapi.json, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits:   { cpu: "1",  memory: 2Gi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            seccompProfile: { type: RuntimeDefault }
+---
+# What the HTTPScaledObject scales toward. Callers never use this name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${SVC_NAME}-backend
+  namespace: <NAMESPACE>
+spec:
+  type: ClusterIP
+  selector: { app: ${SVC_NAME} }
+  ports:
+    - { name: http, port: 8080, targetPort: http }
+---
+# DNS-only alias so in-cluster callers reach the interceptor and wake the pod. An alias does
+# not remap ports, so callers use the interceptor's 8080.
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${SVC_NAME}
+  namespace: <NAMESPACE>
+spec:
+  type: ExternalName
+  externalName: keda-add-ons-http-interceptor-proxy.keda.svc.cluster.local
+---
+apiVersion: http.keda.sh/v1alpha1
+kind: HTTPScaledObject
+metadata:
+  name: ${SVC_NAME}
+  namespace: <NAMESPACE>
+spec:
+  # Host, not path: Traefik strips the public prefix, so a path match would hide the request
+  # from the scaler.
+  hosts:
+    - ${SVC_NAME}.<NAMESPACE>.svc.cluster.local
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ${SVC_NAME}
+    service: ${SVC_NAME}-backend
+    port: 8080
+  # No shared volume here, so replicas are free to spread — unlike service-a (C27).
+  replicas: { min: 0, max: 2 }
+  # 1800: an LLM call can run for minutes, and re-paying a node boot between <NAMESPACE> in a busy
+  # stretch is worse than holding one small pod.
+  scaledownPeriod: 1800
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata: { name: strip-${SVC_NAME}, namespace: <NAMESPACE> }
+spec:
+  stripPrefix: { prefixes: ["${SVC_PATH}"] }
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata: { name: host-${SVC_NAME}, namespace: <NAMESPACE> }
+spec:
+  headers:
+    customRequestHeaders: { Host: ${SVC_NAME}.<NAMESPACE>.svc.cluster.local }
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata: { name: ${SVC_NAME}, namespace: <NAMESPACE> }
+spec:
+  entryPoints: [websecure]
+  routes:
+    # Targets the interceptor cross-namespace. Never target the ExternalName alias above —
+    # Traefik rejects those and the dropped route 404s identically to the interceptor's own.
+    - match: Host(`<PUBLIC_HOST>`) && PathPrefix(`${SVC_PATH}`)
+      kind: Rule
+      middlewares:
+        - { name: <BASIC_AUTH_MIDDLEWARE> }
+        - { name: strip-${SVC_NAME} }
+        - { name: host-${SVC_NAME} }
+      services:
+        - name: keda-add-ons-http-interceptor-proxy
+          namespace: keda
+          port: 8080
+          passHostHeader: true

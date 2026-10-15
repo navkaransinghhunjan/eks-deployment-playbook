@@ -1,0 +1,33 @@
+# `manage.py migrate` once per deploy, not at container start: the web Deployment scales
+# 0..3 and every replica would race the same migration, and an unreachable database would
+# present as a CrashLoop rather than a data problem.
+#
+# A Job's pod template is immutable, so the deploy step deletes and recreates this.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${SVC_NAME}-migrate
+  namespace: <NAMESPACE>
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: <IRSA_SERVICE_ACCOUNT>
+      nodeSelector: { workload: ${SVC_POOL} }
+      tolerations:
+        - { key: workload, operator: Equal, value: ${SVC_POOL}, effect: NoSchedule }
+      containers:
+        - name: migrate
+          image: ${SVC_IMAGE}
+          # Overrides the image ENTRYPOINT, which also starts celery and runserver.
+          command: ["python3", "manage.py", "migrate", "--noinput"]
+          envFrom:
+            - configMapRef: { name: ${SVC_ENDPOINTS}, optional: true }
+            - secretRef:    { name: ${SVC_SECRET} }
+          resources:
+            requests: { cpu: 200m, memory: 512Mi }
+            limits:   { cpu: "1",  memory: 1Gi }
+          securityContext:
+            allowPrivilegeEscalation: false

@@ -1,0 +1,169 @@
+# Self-contained: no `include:` of <CI_TEMPLATES_PROJECT>. Shape follows tenant-b
+# (health-risk-api/.gitlab-ci.yml); see arch_knowlenge_base <NAMESPACE>/install-log.md § 24.
+#
+# Deploys into ns `<NAMESPACE>` — tenant-c shares that namespace (§ 16). No migrate Job and no PVC:
+# this service is stateless.
+variables:
+  AWS_REGION: ap-south-1
+  ECR_HOST: <AWS_ACCOUNT_ID>.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPO: <POOL>/medical-fraud-detection
+  SVC_IMAGE: $ECR_HOST/$ECR_REPO:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA
+  BRANCH_IMAGE: $ECR_HOST/$ECR_REPO:$CI_COMMIT_REF_SLUG
+  CACHE_IMAGE: $ECR_HOST/$ECR_REPO:cache
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "eks"'
+    - if: '$CI_COMMIT_BRANCH == "eks-uat"'
+    - if: "$CI_COMMIT_TAG"
+
+stages:
+  - test
+  - build
+  - deploy
+
+builderrors:
+  stage: test
+  allow_failure: true
+  image: ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/gramener/builderrors:3.2.0
+  script:
+    - builderrors
+
+build:
+  stage: build
+  image: ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/shraddheya/k8s-tools:alpine-1.36-1
+  services:
+    # alias: behind the proxy the image name is no longer "docker".
+    - name: ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/docker:27-dind
+      alias: docker
+  timeout: 1h
+  # Runner pools are spot. A reclaim kills dind and the docker CLI exits 1, which GitLab
+  # records as script_failure — a retry list without it never fires.
+  retry:
+    max: 2
+    when: [script_failure, runner_system_failure, stuck_or_timeout_failure]
+  before_script:
+    # A CI variable holding a human's static key overrides the job pod's IRSA. Unset so the
+    # runner role is used — see .k8s below and ci/deploy-access.md.
+    - unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE
+    - aws sts get-caller-identity
+    - aws ecr get-login-password --region "$AWS_REGION"
+      | docker login --username AWS --password-stdin "$ECR_HOST"
+  script:
+    # this branch's own last push first, else the shared tag so a new branch starts warm
+    - docker pull "$BRANCH_IMAGE" || docker pull "$CACHE_IMAGE" || true
+    - docker build --build-arg BUILDKIT_INLINE_CACHE=1
+      --cache-from "$BRANCH_IMAGE" --cache-from "$CACHE_IMAGE" -t "$SVC_IMAGE" .
+    - docker push "$SVC_IMAGE"
+    - docker tag "$SVC_IMAGE" "$BRANCH_IMAGE" && docker push "$BRANCH_IMAGE"
+    - docker tag "$SVC_IMAGE" "$CACHE_IMAGE"  && docker push "$CACHE_IMAGE"
+    - echo "image  $SVC_IMAGE"
+    - echo "size   $(docker image inspect "$SVC_IMAGE" --format '{{.Size}}') bytes"
+    - echo "digest $(docker image inspect "$SVC_IMAGE" --format '{{index .RepoDigests 0}}')"
+  rules:
+    - when: manual
+
+.k8s:
+  image: ${CI_DEPENDENCY_PROXY_DIRECT_GROUP_IMAGE_PREFIX}/shraddheya/k8s-tools:alpine-1.36-1
+  before_script:
+    # A named human's key carries AmazonEKSAdminPolicy, which derives from the `admin`
+    # ClusterRole and covers NO custom resources — the deploy then applies Deployment and
+    # Service and 403s on every traefik.io / http.keda.sh object, leaving a half-applied
+    # service. Seen on service-a 2026-09-17; ci/deploy-access.md.
+    - unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE
+    - aws sts get-caller-identity
+    # Fail before touching the cluster, not halfway through it.
+    - |
+      aws sts get-caller-identity --query Arn --output text \
+        | grep -q 'GitLabRunnerJobsRole-non-prod' || {
+          echo "FATAL - not the runner IRSA role; traefik/keda objects would 403"
+          exit 1
+        }
+    # Cluster name is a literal, never a CI variable — a group variable once redirected a
+    # non-prod deploy to the POC cluster.
+    - aws eks --region "$AWS_REGION" update-kubeconfig --name non-prod
+    - kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}{"\n"}'
+
+.deploy:
+  extends: .k8s
+  stage: deploy
+  needs: ["build"]
+  variables:
+    SVC_POOL: <POOL>
+    # Overridden per environment so dev and UAT never share config.
+    SVC_ENDPOINTS: <SHARED_CONFIGMAP>
+    SVC_SECRET: <SVC>-secret
+  script:
+    - apk add --no-cache gettext
+    - envsubst '$SVC_NAME $SVC_IMAGE $SVC_POOL $SVC_PATH $SVC_ENDPOINTS $SVC_SECRET'
+      < kubernetes/medical-fraud-detection.yaml | kubectl apply -f -
+    - kubectl -n <NAMESPACE> get deploy/$SVC_NAME svc/$SVC_NAME httpscaledobject.http.keda.sh/$SVC_NAME
+    # KEDA holds it at 0, so `rollout status` would pass without ever pulling the image.
+    - 'echo "deployed $SVC_NAME to pool $SVC_POOL — held at 0 by KEDA"'
+    - 'echo "url  https://<PUBLIC_HOST>$SVC_PATH"'
+    - 'echo "wake it in-cluster before believing it; see <NAMESPACE>/install-log.md § 26"'
+  rules:
+    - when: manual
+
+.teardown:
+  extends: .k8s
+  stage: deploy
+  needs: []
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - kubectl -n <NAMESPACE> delete --ignore-not-found
+      deployment/$SVC_NAME
+      service/$SVC_NAME service/$SVC_NAME-backend
+      httpscaledobject.http.keda.sh/$SVC_NAME
+      middleware.traefik.io/strip-$SVC_NAME middleware.traefik.io/host-$SVC_NAME
+      ingressroute.traefik.io/$SVC_NAME
+  rules:
+    - when: manual
+
+deploy:
+  extends: .deploy
+  variables:
+    SVC_NAME: medical-fraud-detection
+    SVC_PATH: /medical_fraud_detection/eks
+  environment:
+    name: nonprod/medical-fraud-detection
+    url: https://<PUBLIC_HOST>/medical_fraud_detection/eks
+
+deploy:uat:
+  extends: .deploy
+  variables:
+    SVC_NAME: medical-fraud-detection-uat
+    SVC_PATH: /medical_fraud_detection/uat
+    SVC_ENDPOINTS: <SHARED_CONFIGMAP>-uat
+    SVC_SECRET: <SVC>-secret
+  environment:
+    name: uat/medical-fraud-detection
+    url: https://<PUBLIC_HOST>/medical_fraud_detection/uat
+
+teardown:uat:
+  extends: .teardown
+  variables:
+    SVC_NAME: medical-fraud-detection-uat
+  environment:
+    name: uat/medical-fraud-detection
+    action: stop
+
+deploy:branch:
+  extends: .deploy
+  variables:
+    SVC_NAME: medical-fraud-detection-$CI_COMMIT_REF_SLUG
+    SVC_PATH: /medical_fraud_detection/$CI_COMMIT_REF_SLUG
+  environment:
+    name: nonprod/medical-fraud-detection-$CI_COMMIT_REF_SLUG
+    url: https://<PUBLIC_HOST>/medical_fraud_detection/$CI_COMMIT_REF_SLUG
+    on_stop: teardown:branch
+
+teardown:branch:
+  extends: .teardown
+  variables:
+    SVC_NAME: medical-fraud-detection-$CI_COMMIT_REF_SLUG
+  environment:
+    name: nonprod/medical-fraud-detection-$CI_COMMIT_REF_SLUG
+    action: stop

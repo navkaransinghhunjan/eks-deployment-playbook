@@ -1,0 +1,26 @@
+# Rendered at container start by the nginx image's envsubst (/etc/nginx/templates/*.template).
+# The upstreams were hardcoded IPs; they are env vars now so the target can move without a
+# rebuild. Defaults preserve the pre-migration behaviour exactly.
+server {
+    listen 8080;
+    root   /usr/share/nginx/html;
+    index  index.html index.htm;
+    server_tokens off;
+    add_header X-Frame-Options "DENY";
+    proxy_read_timeout 300s;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # The SPA calls /pdxbkd_api on its own origin and nginx proxies it, so the browser never
+    # needs to reach the backend directly — which is what let this move in-cluster (C34).
+    location ^~ /pdxbkd_api/ {
+        proxy_pass  ${PDXBKD_UPSTREAM};
+    }
+
+    # A `location ^~ /file_ui/` block used to sit here, proxying to <HOST:PORT>. That
+    # host does not answer from the cluster and **nothing in this SPA calls /file_ui/** —
+    # checked across src/, no reference in any .ts, .js, .html or .json. Removed rather than
+    # carried forward as a broken proxy nobody uses. install-log C66.
+}
